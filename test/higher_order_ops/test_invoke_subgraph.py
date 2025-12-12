@@ -2995,6 +2995,234 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(len(list(ep.graph_module.named_modules())), 2)
 
 
+class InvokeSubgraphNoRetracingTests(TestCase):
+    def count_cache_hit_with_is_pure(self, gm):
+        """Count occurrences of '# Annotation: {'cache_hit_with_is_pure': ' in the graph string."""
+        graph_str = gm.print_readable(print_output=False)
+        return graph_str.count("# Annotation: {'cache_hit_with_is_pure': ")
+
+    def test_module_no_retracing(self):
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            @nested_compile_region(is_pure=True)
+            def forward(self, x):
+                return torch.sin(x)
+
+        class LLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mod1 = Block()
+                self.mod2 = Block()
+                self.mod3 = Block()
+
+            def forward(self, x):
+                return self.mod3(self.mod2(self.mod1(x)))
+
+        x = torch.randn(8, requires_grad=True)
+        x_clone = x.detach().clone().requires_grad_(True)
+
+        mod = LLM()
+        backend = AotEagerAndRecordGraphs()
+        opt_mod = torch.compile(mod, fullgraph=True, backend=backend)
+
+        ref = mod(x)
+        res = opt_mod(x_clone)
+        self.assertEqual(ref, res)
+        self.assertEqual(self.count_cache_hit_with_is_pure(backend.graphs[0]), 2)
+        ref.sum().backward()
+        res.sum().backward()
+        self.assertEqual(x.grad, x_clone.grad)
+
+    def test_distinct_layers(self):
+        class SinBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            @nested_compile_region(is_pure=True)
+            def forward(self, x):
+                return torch.sin(x)
+
+        class CosBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            @nested_compile_region(is_pure=True)
+            def forward(self, x):
+                return torch.cos(x)
+
+        class LLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mods = [
+                    SinBlock(),
+                    SinBlock(),
+                    CosBlock(),
+                    SinBlock(),
+                    SinBlock(),
+                    CosBlock(),
+                ]
+
+            def forward(self, x):
+                for mod in self.mods:
+                    x = mod(x)
+                return x
+
+        x = torch.randn(8, requires_grad=True)
+        x_clone = x.detach().clone().requires_grad_(True)
+
+        mod = LLM()
+        backend = AotEagerAndRecordGraphs()
+        opt_mod = torch.compile(mod, fullgraph=True, backend=backend)
+
+        ref = mod(x)
+        res = opt_mod(x_clone)
+        self.assertEqual(ref, res)
+        self.assertEqual(self.count_cache_hit_with_is_pure(backend.graphs[0]), 4)
+        ref.sum().backward()
+        res.sum().backward()
+        self.assertEqual(x.grad, x_clone.grad)
+
+    def test_different_inputs(self):
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            @nested_compile_region(is_pure=True)
+            def forward(self, x, y):
+                return (x + y, x * y)
+
+        class LLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mod1 = Block()
+                self.mod2 = Block()
+                self.mod3 = Block()
+
+            def forward(self, x, y):
+                x, y = self.mod1(x, y)
+                x, y = self.mod2(x, y)
+                x, y = self.mod3(x, y)
+                return x + y
+
+        x = torch.randn(8, requires_grad=True)
+        y = torch.randn(8, requires_grad=True)
+        x_clone = x.detach().clone().requires_grad_(True)
+        y_clone = y.detach().clone().requires_grad_(True)
+
+        mod = LLM()
+        backend = AotEagerAndRecordGraphs()
+        opt_mod = torch.compile(mod, fullgraph=True, backend=backend)
+
+        ref = mod(x, y)
+        res = opt_mod(x_clone, y_clone)
+        self.assertEqual(ref, res)
+        self.assertEqual(self.count_cache_hit_with_is_pure(backend.graphs[0]), 2)
+        ref.sum().backward()
+        res.sum().backward()
+        self.assertEqual(x.grad, x_clone.grad)
+        self.assertEqual(y.grad, y_clone.grad)
+
+    def test_nested_io(self):
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            @nested_compile_region(is_pure=True)
+            def forward(self, tup, dt):
+                a = torch.sin(tup[0])
+                b = torch.cos(dt["x"])
+                return (a, b)
+
+        class LLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mod1 = Block()
+                self.mod2 = Block()
+                self.mod3 = Block()
+
+            def forward(self, x):
+                tup1 = [x]
+                dt1 = {"x": torch.sin(x)}
+                x, y = self.mod1(tup1, dt1)
+                tup2 = [x]
+                dt2 = {"x": y}
+                x, y = self.mod2(tup2, dt2)
+                tup3 = [x]
+                dt3 = {"x": y}
+                x, y = self.mod3(tup3, dt3)
+                return x + y
+
+        x = torch.randn(8, requires_grad=True)
+        x_clone = x.detach().clone().requires_grad_(True)
+
+        mod = LLM()
+        backend = AotEagerAndRecordGraphs()
+        opt_mod = torch.compile(mod, fullgraph=True, backend=backend)
+        ref = mod(x)
+        res = opt_mod(x_clone)
+        self.assertEqual(self.count_cache_hit_with_is_pure(backend.graphs[0]), 2)
+        self.assertEqual(ref, res)
+        ref.sum().backward()
+        res.sum().backward()
+        self.assertEqual(x.grad, x_clone.grad)
+
+    def test_functional_module(self):
+        """
+        A simple example of how to take a list of modules and functionalize them
+        in the init method. We also have to update the forward implementation
+        accordingly.
+        """
+
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(8, 8)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class LLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._mods = torch.nn.ModuleList([Block() for _ in range(3)])
+                self.functionalized_modules = [
+                    lambda params, buffers, x: torch.func.functional_call(
+                        module, (params, buffers), x
+                    )
+                    for module in self._mods
+                ]
+                self.functionalized_modules = [
+                    nested_compile_region(f, is_pure=True)
+                    for f in self.functionalized_modules
+                ]
+
+            def forward(self, x):
+                for idx, mod in enumerate(self.functionalized_modules):
+                    x = mod(
+                        dict(self._mods[idx].named_parameters()),
+                        dict(self._mods[idx].named_buffers()),
+                        x,
+                    )
+                return x
+
+        x = torch.randn(8, 8, requires_grad=True)
+        x_clone = x.detach().clone().requires_grad_(True)
+
+        mod = LLM()
+        backend = AotEagerAndRecordGraphs()
+        opt_mod = torch.compile(mod, fullgraph=True, backend=backend)
+
+        ref = mod(x)
+        res = opt_mod(x_clone)
+        self.assertEqual(ref, res)
+        self.assertEqual(self.count_cache_hit_with_is_pure(backend.graphs[0]), 2)
+        ref.sum().backward()
+        res.sum().backward()
+        self.assertEqual(x.grad, x_clone.grad)
+
+
 class NegativeTesting(TestCase):
     def test_graph_break(self):
         @nested_compile_region
